@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+# game data - never commit
+*.obb
+*.apk
+res_map.dat
+
+# extraction output
+main.*/
+*/_unmapped/
+*/_unclaimed/
