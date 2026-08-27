@@ -7,12 +7,11 @@ read `FGIB`. This script extracts it.
 Almost nothing about the format is public, so most of what follows is the format itself
 rather than instructions for the script.
 
-> **Tested against exactly one game:** Contract Killer: Zombies (NR) v3.1.0,
-> `com.glu.android.zombsniper`, `main.310.com.glu.android.zombsniper.obb`.
-> Other Glu titles *might* ship the same container, and some do not: at least one other Glu
-> game's `.obb` is an ordinary zip that any archiver opens. **If `unzip -l` lists files, this
-> tool is not what you need.** If it does not, and the first four bytes are `FGIB`, this is
-> the right tool. Either way, open an issue with what it printed.
+**Tested against exactly one game:** Contract Killer: Zombies (NR) v3.1.0,
+`com.glu.android.zombsniper`, `main.310.com.glu.android.zombsniper.obb`. Other Glu titles
+*might* ship the same container, and some do not: at least one other Glu game's `.obb` is an
+ordinary zip that any archiver opens, so [check yours first](#is-my-obb-this-format). If you
+run this against another title, an issue saying what it printed is welcome either way.
 
 The loader it was reverse engineered from is
 `com::glu::platform::components::CBigFile_v2::Load(CInputStream&, unsigned)` in
@@ -54,7 +53,8 @@ this dump once you know the layout: bucket table at `0x3C` for `0x15DC` bytes, r
 at `0x1618` for `0x49FC`, and `FF FF FF FF` where the dictionary offset would be, meaning
 there is none. [The format](#the-format) walks through the rest.
 
-If the file starts with `PK` it is a zip; open it with anything.
+If the first bytes are `PK` instead, or `unzip -l` lists files, it is an ordinary zip and
+this tool is not what you need.
 
 ---
 
