@@ -180,7 +180,8 @@ What follows separates what was actually observed from what was only inferred:
 | Scheme tag `s2k1` | seen |
 | Scheme tags `djb2`, `sdbm`, `crxx` | accepted by the loader, never seen in a file |
 | Name dictionary | located, always empty here, not implemented |
-| Mime table | not decoded |
+| Mime table | read from the loader, not used by the script |
+| Name hash | read from the loader, matches all 3,872 records |
 | Repacking | not implemented |
 
 ### Section header (60 bytes)
@@ -215,12 +216,15 @@ just the previous offset plus the previous size, and `60 + the five sizes` comes
 offsets and reads the blocks back to back, so a file whose offsets said otherwise would
 load differently from what the extractor reads.
 
-The mime table is small, 4 to 24 bytes per section, and is not decoded.
+The mime table is an array of `u32` type keys, 4 to 24 bytes per section. A record picks
+one through the upper 16 bits of its flags (see below), and `GetStream` hands that key back
+to the caller alongside the data. The script does not need it.
 
 A file can hold several sections back to back; this one holds four, tiling it end to end.
-There is no index of sections, so the script scans for the `FGIB` magic and validates each
-hit: every block must land inside the declared `toc_size`, which is what throws out a
-signature that merely occurred in random data.
+The file carries no index of sections (the game gets their positions from its Java code,
+see [What a repacker has to keep](#what-a-repacker-has-to-keep)), so the script scans for
+the `FGIB` magic and validates each hit: every block must land inside the declared
+`toc_size`, which is what throws out a signature that merely occurred in random data.
 
 ### Bucket table, record table, string table
 
@@ -236,7 +240,7 @@ A record is 16 bytes:
 | 0 | name offset into the string table |
 | 4 | data offset (see below) |
 | 8 | uncompressed size |
-| 12 | flags; **bit 0 = compressed** |
+| 12 | flags; **bit 0 = compressed**, upper 16 bits = index into the mime table |
 
 Names are NUL-terminated ASCII in the string table.
 
@@ -266,19 +270,51 @@ the declared size, wrote whichever came closest. That silent-corruption path nev
 but it would have been invisible if it had. `windowBits` is now pinned to 15 and a size
 mismatch is a counted error, never a written file.
 
-### The hash, and what repacking would take
+### The hash
 
-The scheme tag is a **hash function name**, so the bucket table is a hash table: the engine
-resolves `GetStream("KEYSET_MINIGUN_FIRE")` by hashing the name into a bucket. Extraction
-never needs the hash, because you can walk every bucket blindly, which is what this script
+The bucket table is a hash table: the engine resolves `GetStream("KEYSET_MINIGUN_FIRE")` by
+hashing the name into a bucket. The scheme tag looks like the name of the hash function,
+but in this build it does not choose one. `CBigFile_v2::GetStream(const char*)` hashes
+every name with `core::CStringToKey`, whatever the tag says:
+
+```
+h = length of the name
+for each byte c of the name:
+    h = c ^ rotate_left_32(h, 4)
+bucket = (h & 0x7FFFFFFF) % bucket_count
+```
+
+All 3,872 records in this file sit in the bucket that formula gives. Extraction never needs
+it, because the script walks every bucket blindly. A repacker that adds or renames a file
 does.
 
-Writing a container does need it, but only if names change. **Replacing the contents of
-existing records requires no hash at all**: leave the bucket table, string table and record
-count alone, rewrite the data block, then fix each record's offset, size and compression
-flag plus `toc_size` / `data_size` in the header. That covers what asset replacement
-actually wants. Adding or renaming a file is the case that forces you to reproduce the
-hash; `CBigFile_v2::GetStream(const char*)` is where to read it.
+### What a repacker has to keep
+
+Replacing the contents of records that already exist needs no hash: leave the bucket table,
+string table and record count alone, rewrite the data block, then fix each record's data
+offset, size and bit 0 of its flags, plus `data_size` in the header. Keep the upper 16 bits
+of the flags, they are the mime index, and keep the TOC blocks back to back in header
+order, because that is how the loader reads them.
+
+The harder rule does not come from the file at all. In Contract Killer: Zombies the `.obb`
+is six files laid end to end, and their names and sizes are hardcoded in the APK's Java
+code (`GenSettings.SPECIAL_RES_FILESIZE_ARRAY`):
+
+| # | file | bytes |
+|---|---|---|
+| 1 | `zombsniper.big` | 405,981,562 |
+| 2 | `en.big` | 202,396 |
+| 3 | `wvga.big` | 16,765,283 |
+| 4 | `vga.big` | 23,745,846 |
+| 5 | `CK_Zombie800Android.3gp` | 7,110,792 |
+| 6 | `CK_Zombie1024Android.3gp` | 7,108,144 |
+
+The engine finds each file by adding up the sizes before it, and at startup
+`GluDownloadResMgr` compares the `.obb`'s length with the total. **If it does not match, the
+game deletes the `.obb`.** So a repacked file has to keep all six sizes exactly, unless the
+APK changes too. The sections are packed with no slack, and compressing the records that
+are stored uncompressed frees only about 1.1 MB across the whole file, so in practice a
+replacement has to fit in the space of what it replaces.
 
 ### The dictionary
 
@@ -305,7 +341,9 @@ is left over.
 In this OBB the last 14,218,936 bytes belong to no section at all: two raw 3GP videos,
 800x480 and 1024x576, 45.6 s each, the intro at two qualities. They are *stored*, because
 the engine opens them through `AssetFileDescriptor` as an offset and a length; the APK
-carries the same pairing for the Glu logo.
+carries the same pairing for the Glu logo. The APK's size table (see
+[What a repacker has to keep](#what-a-repacker-has-to-keep)) names them
+`CK_Zombie800Android.3gp` and `CK_Zombie1024Android.3gp`.
 
 Such a range is split only on **validated** MP4 boxes: the four bytes before `ftyp` must be
 a plausible box size. An earlier attempt also split on gzip's two-byte `1f 8b`, which occurs
@@ -324,22 +362,25 @@ cannot be validated is ever used as a cut point.
 - **`assets/res_map.dat` is confirmed in one APK only**, so on another title you may get no
   real file names at all. Extraction itself does not depend on it.
 - **Section discovery is a magic-byte scan**, not an index walk. False hits are validated
-  and reported as rejected candidates; the `FGIB` signature does occur in random data.
+  and reported as rejected candidates; the `FGIB` signature does occur in random data. The
+  game itself takes the positions from a size table in its Java code, which the script
+  cannot see from the `.obb` alone.
 - **The dictionary path warns instead of working** (see above). It is `0xFFFFFFFF` / size 0
   in every section seen so far, so it has never had to run.
-- **The mime table is undecoded**, read past but never parsed.
+- **The mime table is read past, not used.** Its layout is known (see above), but nothing
+  the script writes depends on the type key.
 - **Read-only.** There is no repacker. The notes above are what a repacker would need.
 - **Only the `s2k1` scheme tag has actually been seen.** `djb2`, `sdbm` and `crxx` are
   accepted because the loader accepts them, not because a file carrying one has been
-  tested. Extraction ignores the hash entirely, so this should not matter, but it is a
-  guess, not a result.
+  tested. In this build the lookup hashes with `CStringToKey` whatever the tag, and
+  extraction ignores the hash entirely, so this should not matter, but it is a guess, not a
+  result.
 
 ## If you want to write a repacker
 
 There is no repacker here, but the container half of that job is the easy half.
-[The hash, and what repacking would take](#the-hash-and-what-repacking-would-take) has the
-recipe: replacing the contents of records that already exist needs no hash and no
-dictionary, only rewritten offsets, sizes and flags.
+[What a repacker has to keep](#what-a-repacker-has-to-keep) has the recipe and the one hard
+rule: every section keeps its exact size, or the game deletes the `.obb`.
 
 The hard half is what the records hold, and that is per game, not per format. Everything
 below is Contract Killer: Zombies specifically, offered as an example of the shape of the
@@ -348,13 +389,19 @@ problem rather than as a description of Glu's engine:
 - Level geometry under `res/zombies/3d/locations` is **M3G** (JSR-184), 19 files holding
   1,624 meshes.
 - Those same files also hold 603 `Image2D` objects, so the level textures live inside the
-  scene files instead of sitting beside them. The 1,063 loose PNGs turned out to be UI and
-  2D art.
-- Sections inside an M3G can be zlib-compressed and carry their own Adler-32, so editing
-  one means rebuilding lengths and checksums. That is a second format nested inside this
-  one, and this tool does not go near it.
-- The renderer is fixed-function GLES1, so asset quality is the only lever there is, and
-  the lighting is baked into `lighting_grad*.m3g` meshes rather than computed at runtime.
+  scene files instead of sitting beside them; no M3G file in the `.obb` references an
+  outside image. Most of the 1,104 records that are PNG images are UI and 2D art, but not
+  all: 122 are character skins (body, head and legs variants such as
+  `BIN_UNIT_TEXTURE_BODY_CIVILIAN_01_01`) and 23 are weapon skins. No M3G refers to them,
+  so they reach the models through the game's code, not through the scene files.
+- Every section inside an M3G carries its own Adler-32, and here half of them (19 of 38)
+  are also zlib-compressed, so editing one means rebuilding lengths and checksums. That is
+  a second format nested inside this one, and this tool does not go near it.
+- The renderer is fixed-function GLES1: the library imports no shader functions at all, so
+  asset quality is the main lever. Lighting is fixed-function too, and computed at
+  runtime: the level files carry 43 `Light` and 47 `Material` objects, and the engine's
+  `CssRenderState` switches on `GL_LIGHTING` and hands them to `glLightfv`. The
+  `lighting_grad*.m3g` files are not meshes despite the name, but 8x128 PNG gradients.
 
 The pattern worth taking from that: swapping a record's bytes is easy, swapping what the
 player actually sees usually is not, because the interesting content sits one format deeper.
