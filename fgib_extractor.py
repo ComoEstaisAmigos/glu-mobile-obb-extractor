@@ -255,6 +255,10 @@ def guess_ext(data):
         if data[:len(sig)] == sig:
             return ext
     head = data[:256]
+    if len(data) <= 256:
+        # Strings are stored NUL-terminated, and in a short one the terminator alone
+        # pulls the printable share under the threshold.
+        head = head.rstrip(b'\x00')
     printable = sum(1 for b in head if 9 <= b <= 13 or 32 <= b < 127)
     if head and printable / len(head) > 0.9:
         if b'<?xml' in head or (b'<' in head and b'>' in head):
