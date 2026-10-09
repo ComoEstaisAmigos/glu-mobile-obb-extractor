@@ -115,9 +115,9 @@ class BigFileTOC:
 
             # Twelve u32: five (offset, size) pairs for the blocks, then toc_size and
             # data_size. The offsets are relative to the section start, and 0xFFFFFFFF
-            # marks a block that is not present. The blocks do sit contiguously right
-            # after this 60-byte header, so reading straight through works on every file
-            # seen so far -- but the offsets are what the loader seeks to, so follow them.
+            # marks a block that is not present. The loader ignores these offsets and
+            # reads the blocks back to back after this 60-byte header; in every file seen
+            # so far the offsets describe exactly that layout, so following them is the same.
             (bucket_off, self.bucket_table_size,
              record_off, self.record_table_size,
              mime_off, self.mime_table_size,
@@ -151,7 +151,7 @@ class BigFileTOC:
             self.block5 = read_block(string_off, self.string_table_size)
 
         self.bucket_count = self.bucket_table_size // 4
-        self.data_section_abs_start = section_start + self.toc_size
+        self.section_size = self.toc_size + self.data_size
 
 
 def read_cstr(buf, offset):
@@ -201,8 +201,20 @@ ZLIB_WBITS = 15
 DECOMP_STATS = {'exact': 0, 'size_mismatch': 0, 'zlib_error': 0}
 
 
-def read_resource_bytes(f, abs_off, rec):
-    f.seek(abs_off)
+def check_in_section(toc, start, length):
+    # A range that leaves its section is read from a neighbour, which is how a wrong
+    # offset base once produced 1,932 files of garbage without a single error.
+    if start < toc.toc_size or start + length > toc.section_size:
+        raise ValueError('data range %d..%d falls outside the section (TOC %d, total %d)'
+                         % (start, start + length, toc.toc_size, toc.section_size))
+
+
+def read_resource_bytes(f, toc, rec):
+    # The loader opens each section as a file of its own and seeks straight to the
+    # record's data offset, so the offset counts from the section start, TOC included.
+    start = rec['data_offset']
+    check_in_section(toc, start, 4 if rec['is_compressed'] else rec['data_size'])
+    f.seek(toc.section_start + start)
     if not rec['is_compressed']:
         data = f.read(rec['data_size'])
         if len(data) != rec['data_size']:
@@ -210,6 +222,7 @@ def read_resource_bytes(f, abs_off, rec):
                              % (len(data), rec['data_size']))
         return data
     compressed_size = read_u32(f)
+    check_in_section(toc, start, 4 + compressed_size)
     raw = f.read(compressed_size)
     try:
         data = zlib.decompress(raw, ZLIB_WBITS)
@@ -328,38 +341,6 @@ def resolve_output_path(out_root, name, res_map, used_paths, unmapped_ext=None, 
     return os.path.join(out_root, rel)
 
 
-def offset_candidates(toc, data_offset):
-    return {
-        'A': toc.section_start + data_offset,
-        'B': toc.data_section_abs_start + data_offset,
-    }
-
-
-def find_offset_base(toc, f, entries):
-    scores = {'A': 0, 'B': 0}
-    tested = 0
-    for rec in entries:
-        if tested >= 40 or rec['data_size'] == 0:
-            continue
-        matched_any = False
-        for mode, off in offset_candidates(toc, rec['data_offset']).items():
-            try:
-                f.seek(off)
-                head = f.read(16)
-            except Exception:
-                head = b''
-            if any(head[:len(sig)] == sig for sig, _ in SIGS):
-                scores[mode] += 1
-                matched_any = True
-        if matched_any:
-            tested += 1
-    if scores['A'] >= scores['B'] and scores['A'] > 0:
-        return 'A'
-    if scores['B'] > 0:
-        return 'B'
-    return 'A'
-
-
 def find_fgib_sections(path):
     positions = []
     chunk_size = 1 << 20
@@ -415,7 +396,7 @@ def print_error_summary(label, errors):
         print('   ', line)
 
 
-def collect_sections(obb_path, candidates, f):
+def collect_sections(obb_path, candidates):
     sections = []
     rejected = []
     for sec_start in candidates:
@@ -428,9 +409,8 @@ def collect_sections(obb_path, candidates, f):
         if not entries:
             rejected.append((sec_start, 'header is valid but holds no records'))
             continue
-        base_mode = find_offset_base(toc, f, entries)
-        print('Section @%d -> %d records (data base %s, TOC %d + data %d)'
-              % (sec_start, len(entries), base_mode, toc.toc_size, toc.data_size))
+        print('Section @%d -> %d records (TOC %d + data %d)'
+              % (sec_start, len(entries), toc.toc_size, toc.data_size))
         if toc.dictionary_size:
             # The string table can reference the dictionary through 0x1A bytes; in the
             # game library CBigFile_v2::DecompressIntoDestinationBufferIfNeeded expands
@@ -439,7 +419,7 @@ def collect_sections(obb_path, candidates, f):
             print('    ! WARNING: this section carries a %d-byte name dictionary,'
                   ' which this script does not use.' % toc.dictionary_size)
             print('      File names that reference it may come out incomplete.')
-        sections.append((toc, entries, base_mode))
+        sections.append((toc, entries))
     if rejected:
         print()
         print('%d candidates carried an FGIB signature but were REJECTED:' % len(rejected))
@@ -460,8 +440,8 @@ def collect_sections(obb_path, candidates, f):
 
 def unclaimed_regions(path, sections_data):
     total = os.path.getsize(path)
-    claimed = sorted((t.section_start, t.section_start + t.toc_size + t.data_size)
-                     for t, _, _ in sections_data)
+    claimed = sorted((t.section_start, t.section_start + t.section_size)
+                     for t, _ in sections_data)
     gaps = []
     cursor = 0
     for start, end in claimed:
@@ -569,13 +549,13 @@ def extract_records(sections_data, res_map, out_root, f, extract_unmapped):
     write_errors = []
     res_map_exists = bool(res_map)
     total_records = sum(
-        1 for _, entries, _ in sections_data for rec in entries
+        1 for _, entries in sections_data for rec in entries
         if rec['name'] in res_map or extract_unmapped
     )
     processed = 0
     last_pct = -1
     print()
-    for toc, entries, base_mode in sections_data:
+    for toc, entries in sections_data:
         for rec in entries:
             is_mapped = rec['name'] in res_map
             if not is_mapped and not extract_unmapped:
@@ -586,9 +566,8 @@ def extract_records(sections_data, res_map, out_root, f, extract_unmapped):
                 if pct != last_pct:
                     render_progress('Extracting... %d%% (%d/%d)' % (pct, processed, total_records))
                     last_pct = pct
-            abs_off = offset_candidates(toc, rec['data_offset'])[base_mode]
             try:
-                data = read_resource_bytes(f, abs_off, rec)
+                data = read_resource_bytes(f, toc, rec)
             except Exception as e:
                 read_errors.append('%s -> %s' % (rec['name'], e))
                 continue
@@ -611,14 +590,14 @@ def process_obb(obb_path, out_root, res_map):
     print('FGIB candidates:', len(candidates))
     f = open(obb_path, 'rb')
 
-    sections_data = collect_sections(obb_path, candidates, f)
+    sections_data = collect_sections(obb_path, candidates)
     if not sections_data:
         f.close()
         print('\n[ERROR]: no section matching the FGIB format was found in this file.')
         print('\nThe file may not be in the expected format:', obb_path)
         return None
-    total_entries = sum(len(entries) for _, entries, _ in sections_data)
-    total_mapped = sum(sum(1 for e in entries if e['name'] in res_map) for _, entries, _ in sections_data)
+    total_entries = sum(len(entries) for _, entries in sections_data)
+    total_mapped = sum(sum(1 for e in entries if e['name'] in res_map) for _, entries in sections_data)
     total_unmapped = total_entries - total_mapped
 
     print('Valid sections:', len(sections_data))

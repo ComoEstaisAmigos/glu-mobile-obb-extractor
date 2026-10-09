@@ -90,10 +90,10 @@ res_map.dat found, 1008 original path mappings loaded.
 
 === Reading: main.310.com.glu.android.zombsniper.obb ===
 FGIB candidates: 4
-Section @0          -> 1116 records (data base A, TOC 54050 + data 405927512)
-Section @405981562  -> 1932 records (data base B, TOC 109546 + data 92850)
-Section @406183958  ->  408 records (data base A, TOC 21102 + data 16744181)
-Section @422949241  ->  416 records (data base A, TOC 21479 + data 23724367)
+Section @0 -> 1116 records (TOC 54050 + data 405927512)
+Section @405981562 -> 1932 records (TOC 109546 + data 92850)
+Section @406183958 -> 408 records (TOC 21102 + data 16744181)
+Section @422949241 -> 416 records (TOC 21479 + data 23724367)
 Valid sections: 4
 Total records: 3872 | matched by res_map.dat: 1662 | unmatched: 2210
 
@@ -173,7 +173,7 @@ What follows separates what was actually observed from what was only inferred:
 |---|---|
 | Header, and its five block offset/size pairs | confirmed, in all four sections |
 | Bucket, record and string table layout | confirmed |
-| Per-section data offset base, A or B | confirmed, both occur in one file |
+| Data offsets count from the section start | read from the loader, holds for every record |
 | zlib with `windowBits = 15` | read from the loader, matched by every compressed record |
 | Scheme tag `s2k1` | seen |
 | Scheme tags `djb2`, `sdbm`, `crxx` | accepted by the loader, never seen in a file |
@@ -209,8 +209,9 @@ built against, alongside a size of 0.
 
 The blocks do sit contiguously right after the header, in that order, so each offset is
 just the previous offset plus the previous size, and `60 + the five sizes` comes to exactly
-`toc_size`. That holds in all four sections here. The extractor still seeks to the declared
-offsets rather than reading straight through, because those are what the loader uses.
+`toc_size`. That holds in all four sections here. The loader itself ignores the declared
+offsets and reads the blocks back to back, so a file whose offsets said otherwise would
+load differently from what the extractor reads.
 
 The mime table is small, 4 to 24 bytes per section, and is not decoded.
 
@@ -237,18 +238,18 @@ A record is 16 bytes:
 
 Names are NUL-terminated ASCII in the string table.
 
-### Trap 1: the data offset base is not fixed
+### Trap 1: data offsets count from the section start
 
-A record's data offset is relative to either
+A record's data offset is relative to the section start, TOC included, so the first record
+sits at exactly `toc_size`. The loader opens each section as a file of its own and seeks
+straight to that offset in `CBigFile_v2::GetStream`.
 
-- **A**: `section_start + offset`, or
-- **B**: `section_start + toc_size + offset`
-
-and both occur *in the same file*. In Contract Killer: Zombies three sections use A and one
-uses B. There is no flag for it; the script decides per section by trying both bases on up
-to 40 records and keeping whichever lands more of them on a known file signature.
-
-Do not hardcode this.
+An earlier version of this script believed a second base, `section_start + toc_size +
+offset`, also occurred, and picked one per section by checking which landed more records on
+a known file signature. The section holding the English strings has 1,932 records and no
+signatures at all, so the vote went the wrong way there and every one of those records came
+out as bytes read from the next section, with no error reported. The base is fixed now, and
+a record whose data range leaves its section is a read error instead of a written file.
 
 ### Trap 2: compressed records are zlib with a header, `windowBits = 15`
 
