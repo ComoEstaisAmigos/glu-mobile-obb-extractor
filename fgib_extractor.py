@@ -22,20 +22,6 @@ def wait_for_keypress():
         pass
 
 
-REQUIRED_MODULES = ['struct', 'zlib', 'glob', 'traceback', 'io']
-missing = []
-for mod in REQUIRED_MODULES:
-    try:
-        __import__(mod)
-    except ImportError:
-        missing.append(mod)
-if missing:
-    print('Missing Python modules:', ', '.join(missing))
-    print('\nThese normally ship with Python; your installation may be broken.')
-    print('\nYou can try: pip install ' + ' '.join(missing))
-    wait_for_keypress()
-    sys.exit(1)
-
 import struct
 import zlib
 import glob
