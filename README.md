@@ -22,7 +22,7 @@ checked against a real file.
 
 Single file, Python 3 standard library only, no dependencies.
 
-Want to play the game rather than take it apart? [ck-zombies-morphe-patches](https://github.com/ComoEstaisAmigos/ck-zombies-morphe-patches) makes Contract Killer: Zombies run on current Android, Android 16 included.
+Want to play the game rather than take it apart? [ComoEstaisAmigos/morphe-patches](https://github.com/ComoEstaisAmigos/morphe-patches) makes Contract Killer: Zombies run on current Android, Android 16 included.
 
 ---
 
